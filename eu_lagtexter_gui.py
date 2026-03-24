@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
-EU-lagtexter GUI — Sök, välj och analysera lagtexter från EU-kommissionen.
+EU-lagtexter GUI -- Sok, valj och analysera lagtexter fran EU-kommissionen.
 
 Tkinter-baserat GUI med:
-- Sök och filtrera dokument (typ, år, nyckelord)
+- Sok och filtrera dokument (typ, ar, nyckelord)
 - Sorterbar dokumentlista med fulla titlar
-- Lägg till / ta bort valda dokument
-- Artikelvisning med krav markerade i färg, icke-krav gråmarkerade
-- Kravextrahering med subjektsidentifiering och -kategorisering
+- Lagg till / ta bort valda dokument
+- Artikelvisning i nummerordning med fullstandig text
+- Kravextrahering: identifierar krav pa foretag/verksamheter
+  - Hanterar sammansatta subjekt ("vasentliga och viktiga entiteter")
+  - Normaliserar grammatiska former (bestamt/plural -> obestamd singular)
+  - Hanterar passiv form (subjekt fran foregaende kontext)
+  - Hanterar att-bisatser (objektbisatser med eget subjekt)
+  - Punktlistor = separata krav
+  - Filtrerar bort krav pa EU/medlemsstater/myndigheter
+  - Artiklar om Inforlivande/Andring/Upphavande/Ikraftträdande = ej relevanta
 """
 
 import tkinter as tk
@@ -20,26 +27,26 @@ import urllib.request
 import urllib.parse
 from dataclasses import dataclass, field
 
-# ── API-konstanter ──────────────────────────────────────────────────────────
+# -- API-konstanter -----------------------------------------------------------
 
 SPARQL_ENDPOINT = "https://publications.europa.eu/webapi/rdf/sparql"
 EURLEX_HTML_URL = (
     "https://eur-lex.europa.eu/legal-content/{lang}/TXT/HTML/?uri=CELEX:{celex}"
 )
 
-# ── Datamodell ──────────────────────────────────────────────────────────────
+# -- Datamodell ---------------------------------------------------------------
 
 
 @dataclass
 class Article:
     number: str          # t.ex. "1", "2", "21"
-    title: str           # t.ex. "Innehåll", "Tillämpningsområde"
+    title: str           # t.ex. "Innehall", "Tillampningsomrade"
     paragraphs: list     # lista av Paragraph
 
 
 @dataclass
 class Paragraph:
-    number: str          # t.ex. "1", "2", "a", "" (för brödtext)
+    number: str          # t.ex. "1", "2", "a", "" (for brodtext)
     text: str
     children: list = field(default_factory=list)  # underpunkter
 
@@ -49,8 +56,9 @@ class Obligation:
     article: str
     paragraph: str
     text: str
-    subject: str
-    subject_category: str  # "entity", "eu_institution", "member_state", "other"
+    subjects: list       # lista av normaliserade subjekt
+    original_subject: str  # den ursprungliga texten
+    subject_category: str  # "entity", "eu", "member_state", "other"
 
 
 @dataclass
@@ -66,7 +74,7 @@ class Document:
     def type_label(self) -> str:
         code = self.celex[5:6] if len(self.celex) > 5 else ""
         return {
-            "R": "Förordning",
+            "R": "Forordning",
             "L": "Direktiv",
             "D": "Beslut",
             "H": "Rekommendation",
@@ -79,7 +87,7 @@ class Document:
         return hash(self.celex)
 
 
-# ── API-funktioner ──────────────────────────────────────────────────────────
+# -- API-funktioner -----------------------------------------------------------
 
 
 def sparql_query(query: str) -> list[dict]:
@@ -151,7 +159,7 @@ def fetch_html(celex: str, lang: str = "SV") -> str:
 
 def strip_html(html_text: str) -> str:
     text = re.sub(r"<style[^>]*>.*?</style>", "", html_text, flags=re.DOTALL | re.I)
-    text = re.sub(r"<script[^>]*>.*?</script>", "", html_text, flags=re.DOTALL | re.I)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.I)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     text = re.sub(r"</(p|div|h[1-6]|li|tr)>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
@@ -161,22 +169,13 @@ def strip_html(html_text: str) -> str:
     return text.strip()
 
 
-# ── Artikelparser ───────────────────────────────────────────────────────────
+# -- Artikelparser ------------------------------------------------------------
 
 
 def parse_articles(raw_html: str) -> list[Article]:
-    """Parsa HTML från EUR-Lex och extrahera artiklar med stycken."""
+    """Parsa HTML fran EUR-Lex och extrahera artiklar med stycken."""
     articles = []
 
-    # Hitta alla eli-subdivision-block som innehåller artiklar
-    # Mönster: <div class="eli-subdivision" id="art_N">...</div>
-    art_pattern = re.compile(
-        r'<div\s+class="eli-subdivision"\s+id="(art_\d+)">(.*?)</div>\s*(?=<div\s+class="eli-subdivision"|</div>\s*<div\s+class="eli-subdivision"|$)',
-        re.DOTALL,
-    )
-
-    # Enklare approach: dela på artikelrubriker
-    # Hitta alla "Artikel N" med omgivande kontext
     art_header_pattern = re.compile(
         r'<p[^>]*class="oj-ti-art"[^>]*>(Artikel)\s*\W*(\d+)</p>',
         re.IGNORECASE,
@@ -184,7 +183,6 @@ def parse_articles(raw_html: str) -> list[Article]:
 
     headers = list(art_header_pattern.finditer(raw_html))
     if not headers:
-        # Försök engelska
         art_header_pattern = re.compile(
             r'<p[^>]*class="oj-ti-art"[^>]*>(Article)\s*\W*(\d+)</p>',
             re.IGNORECASE,
@@ -194,21 +192,21 @@ def parse_articles(raw_html: str) -> list[Article]:
     for i, match in enumerate(headers):
         art_num = match.group(2)
 
-        # Extrahera text fram till nästa artikel
         start = match.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(raw_html)
         section_html = raw_html[start:end]
 
-        # Hämta artikelns titel (class="oj-sti-art")
         title_match = re.search(
             r'<p[^>]*class="oj-sti-art"[^>]*>(.*?)</p>', section_html, re.DOTALL
         )
         art_title = strip_html(title_match.group(1)).strip() if title_match else ""
 
-        # Extrahera stycken
         paragraphs = _parse_paragraphs(section_html)
 
         articles.append(Article(number=art_num, title=art_title, paragraphs=paragraphs))
+
+    # Sortera artiklar i nummerordning
+    articles.sort(key=lambda a: int(a.number) if a.number.isdigit() else 0)
 
     return articles
 
@@ -217,11 +215,8 @@ def _parse_paragraphs(section_html: str) -> list[Paragraph]:
     """Parsa stycken inom en artikel."""
     paragraphs = []
 
-    # Hitta numrerade stycken: "1.   Text..." eller bara brödtext
-    # EUR-Lex använder <p class="oj-normal"> för vanliga stycken
     p_pattern = re.compile(r'<p[^>]*class="oj-normal"[^>]*>(.*?)</p>', re.DOTALL)
 
-    # Hitta tabellbaserade punktlistor (a), b), c) etc.)
     current_para_num = ""
     current_text_parts = []
 
@@ -231,10 +226,8 @@ def _parse_paragraphs(section_html: str) -> list[Paragraph]:
         if not text:
             continue
 
-        # Kolla om stycket börjar med ett nummer: "1.   " eller "1.  "
         num_match = re.match(r"^(\d+)\.\s{2,}", text)
         if num_match:
-            # Spara föregående stycke om det finns
             if current_text_parts:
                 paragraphs.append(Paragraph(
                     number=current_para_num,
@@ -244,19 +237,16 @@ def _parse_paragraphs(section_html: str) -> list[Paragraph]:
             current_para_num = num_match.group(1)
             current_text_parts = [text[num_match.end():].strip()]
         else:
-            # Kolla underpunkter: a), b) etc.
             sub_match = re.match(r"^([a-z]\))\s*", text)
             if sub_match:
                 current_text_parts.append(text)
             else:
-                # Vanlig fortsättningstext
                 if current_text_parts:
                     current_text_parts.append(text)
                 else:
                     current_para_num = ""
                     current_text_parts = [text]
 
-    # Sista stycket
     if current_text_parts:
         paragraphs.append(Paragraph(
             number=current_para_num,
@@ -266,34 +256,249 @@ def _parse_paragraphs(section_html: str) -> list[Paragraph]:
     return paragraphs
 
 
-# ── Kravextrahering med subjektsidentifiering ───────────────────────────────
+# -- Subjektsnormalisering ----------------------------------------------------
+
+# Mappning fran alla grammatiska former till normaliserad form (obestamd singular)
+SUBJECT_NORMALIZATION = {
+    # Entitet
+    "entiteten": "entitet",
+    "entiteter": "entitet",
+    "entiteterna": "entitet",
+    "entiteters": "entitet",
+    "entiteternas": "entitet",
+    # Vasentlig entitet
+    "vasentliga entiteten": "vasentlig entitet",
+    "vasentliga entiteter": "vasentlig entitet",
+    "vasentliga entiteterna": "vasentlig entitet",
+    "vasentlig entitet": "vasentlig entitet",
+    "de vasentliga entiteterna": "vasentlig entitet",
+    "en vasentlig entitet": "vasentlig entitet",
+    # Viktig entitet
+    "viktiga entiteten": "viktig entitet",
+    "viktiga entiteter": "viktig entitet",
+    "viktiga entiteterna": "viktig entitet",
+    "viktig entitet": "viktig entitet",
+    "de viktiga entiteterna": "viktig entitet",
+    "en viktig entitet": "viktig entitet",
+    # Berord entitet
+    "den berorda entiteten": "berord entitet",
+    "berorda entiteter": "berord entitet",
+    "berorda entiteterna": "berord entitet",
+    "de berorda entiteterna": "berord entitet",
+    # Operator
+    "operatoren": "operator",
+    "operatorer": "operator",
+    "operatorerna": "operator",
+    # Tjanste-/tillhandahallare
+    "tjanstleverantoren": "tjanstleverantor",
+    "tjanstleverantorer": "tjanstleverantor",
+    "tjanstleverantorerna": "tjanstleverantor",
+    "tillhandahallaren": "tillhandahallare",
+    "tillhandahallare": "tillhandahallare",
+    "tillhandahallarna": "tillhandahallare",
+    # Leverantor
+    "leverantoren": "leverantor",
+    "leverantorer": "leverantor",
+    "leverantorerna": "leverantor",
+    # Verksamhetsutovare
+    "verksamhetsutovaren": "verksamhetsutovare",
+    "verksamhetsutovare": "verksamhetsutovare",
+    "verksamhetsutovarna": "verksamhetsutovare",
+    # Foretag
+    "foretaget": "foretag",
+    "foretagen": "foretag",
+    "foretagets": "foretag",
+    "foretagens": "foretag",
+    # Organisation
+    "organisationen": "organisation",
+    "organisationer": "organisation",
+    "organisationerna": "organisation",
+    # Registreringsenhet
+    "registreringsenheten": "registreringsenhet",
+    "registreringsenheter": "registreringsenhet",
+    "registreringsenheterna": "registreringsenhet",
+    # Ledningsorgan
+    "ledningsorganet": "ledningsorgan",
+    "ledningsorganen": "ledningsorgan",
+    "ledningsorganets": "ledningsorgan",
+    "ledningsorganens": "ledningsorgan",
+}
+
+# Bygg aven en version med svenska tecken (a, o, etc.)
+_SWEDISH_NORM = {}
+_ACCENT_MAP = str.maketrans({
+    'a': None, 'o': None,
+})
+
+
+def _build_swedish_normalization():
+    """Bygg upp normalisering med riktiga svenska tecken."""
+    # Manuell mappning med korrekta svenska tecken
+    sw = {
+        # Entitet
+        "entiteten": "entitet",
+        "entiteter": "entitet",
+        "entiteterna": "entitet",
+        "entiteters": "entitet",
+        "entiteternas": "entitet",
+        # Vasentlig entitet
+        "\u00e4sentliga entiteten": "v\u00e4sentlig entitet",
+        "v\u00e4sentliga entiteter": "v\u00e4sentlig entitet",
+        "v\u00e4sentliga entiteterna": "v\u00e4sentlig entitet",
+        "v\u00e4sentlig entitet": "v\u00e4sentlig entitet",
+        "de v\u00e4sentliga entiteterna": "v\u00e4sentlig entitet",
+        "en v\u00e4sentlig entitet": "v\u00e4sentlig entitet",
+        # Viktig entitet
+        "viktiga entiteten": "viktig entitet",
+        "viktiga entiteter": "viktig entitet",
+        "viktiga entiteterna": "viktig entitet",
+        "viktig entitet": "viktig entitet",
+        "de viktiga entiteterna": "viktig entitet",
+        "en viktig entitet": "viktig entitet",
+        # Berord entitet
+        "den ber\u00f6rda entiteten": "ber\u00f6rd entitet",
+        "ber\u00f6rda entiteter": "ber\u00f6rd entitet",
+        "ber\u00f6rda entiteterna": "ber\u00f6rd entitet",
+        "de ber\u00f6rda entiteterna": "ber\u00f6rd entitet",
+        # Operat\u00f6r
+        "operat\u00f6ren": "operat\u00f6r",
+        "operat\u00f6rer": "operat\u00f6r",
+        "operat\u00f6rerna": "operat\u00f6r",
+        # Tj\u00e4nsteleverant\u00f6r
+        "tj\u00e4nsteleverant\u00f6ren": "tj\u00e4nsteleverant\u00f6r",
+        "tj\u00e4nsteleverant\u00f6rer": "tj\u00e4nsteleverant\u00f6r",
+        "tj\u00e4nsteleverant\u00f6rerna": "tj\u00e4nsteleverant\u00f6r",
+        "tillhandah\u00e5llaren": "tillhandah\u00e5llare",
+        "tillhandah\u00e5llare": "tillhandah\u00e5llare",
+        "tillhandah\u00e5llarna": "tillhandah\u00e5llare",
+        # Leverant\u00f6r
+        "leverant\u00f6ren": "leverant\u00f6r",
+        "leverant\u00f6rer": "leverant\u00f6r",
+        "leverant\u00f6rerna": "leverant\u00f6r",
+        # Verksamhetsut\u00f6vare
+        "verksamhetsut\u00f6varen": "verksamhetsut\u00f6vare",
+        "verksamhetsut\u00f6vare": "verksamhetsut\u00f6vare",
+        "verksamhetsut\u00f6varna": "verksamhetsut\u00f6vare",
+        # F\u00f6retag
+        "f\u00f6retaget": "f\u00f6retag",
+        "f\u00f6retagen": "f\u00f6retag",
+        "f\u00f6retagets": "f\u00f6retag",
+        "f\u00f6retagens": "f\u00f6retag",
+        # Organisation
+        "organisationen": "organisation",
+        "organisationer": "organisation",
+        "organisationerna": "organisation",
+        # Registreringsenhet
+        "registreringsenheten": "registreringsenhet",
+        "registreringsenheter": "registreringsenhet",
+        "registreringsenheterna": "registreringsenhet",
+        # Ledningsorgan
+        "ledningsorganet": "ledningsorgan",
+        "ledningsorganen": "ledningsorgan",
+        "ledningsorganets": "ledningsorgan",
+        "ledningsorganens": "ledningsorgan",
+    }
+    return sw
+
+
+SUBJECT_NORM_SV = _build_swedish_normalization()
+
+
+def normalize_subject(raw: str) -> str:
+    """Normalisera ett subjekt till obestamd singular-form."""
+    lowered = raw.strip().lower()
+    # Forsok exakt matchning
+    if lowered in SUBJECT_NORM_SV:
+        return SUBJECT_NORM_SV[lowered]
+    # Forsok delstrangs-matchning (langsta forst)
+    for form, norm in sorted(SUBJECT_NORM_SV.items(), key=lambda x: -len(x[0])):
+        if form in lowered:
+            return norm
+    return raw.strip()
+
+
+def split_compound_subjects(subject_text: str) -> list[str]:
+    """
+    Dela sammansatta subjekt.
+    "vasentliga och viktiga entiteter" -> ["vasentlig entitet", "viktig entitet"]
+    "operatorer och tjanstleverantorer" -> ["operator", "tjanstleverantor"]
+    """
+    lowered = subject_text.lower().strip()
+
+    # Monster: "X och Y SUBSTANTIV" (t.ex. "vasentliga och viktiga entiteter")
+    compound_pattern = re.compile(
+        r'([\w\u00e4\u00f6\u00e5]+)\s+och\s+([\w\u00e4\u00f6\u00e5]+)\s+([\w\u00e4\u00f6\u00e5]+)',
+        re.IGNORECASE,
+    )
+    m = compound_pattern.search(lowered)
+    if m:
+        adj1, adj2, noun = m.group(1), m.group(2), m.group(3)
+        # Kolla om det ar adjektiv + adjektiv + substantiv
+        # Testa: ar "adj1 noun" och "adj2 noun" kanda?
+        candidate1 = f"{adj1} {noun}"
+        candidate2 = f"{adj2} {noun}"
+        n1 = normalize_subject(candidate1)
+        n2 = normalize_subject(candidate2)
+        if n1 != candidate1 or n2 != candidate2:
+            # Minst en kand -> returnera bada
+            return [n1, n2]
+
+    # Monster: "X och Y" (t.ex. "operatorer och tjanstleverantorer")
+    and_pattern = re.compile(r'\s+och\s+', re.IGNORECASE)
+    if and_pattern.search(lowered):
+        parts = and_pattern.split(lowered)
+        results = []
+        for p in parts:
+            p = p.strip()
+            if p:
+                results.append(normalize_subject(p))
+        if len(results) > 1:
+            return results
+
+    # Inget sammansatt -> normalisera direkt
+    return [normalize_subject(subject_text)]
+
+
+# -- Kravextrahering med forbattrad subjektsidentifiering ---------------------
 
 # Subjekt som ska filtreras bort (EU-institutioner, medlemsstater, myndigheter)
-EU_SUBJECTS = {
-    "kommissionen", "europeiska kommissionen", "europaparlamentet",
-    "rådet", "europeiska rådet", "ministerrådet",
-    "enisa", "eu-cyclone", "csirt", "csirt-enheter", "csirt-nätverket",
-    "samarbetsgruppen", "europeiska datatillsynsmannen",
-    "europeiska unionens byrå för cybersäkerhet",
-    "the commission", "european commission", "european parliament",
-    "the council", "council",
-}
+EU_SUBJECTS_PATTERNS = [
+    r"\bkommissionen\b", r"\beuropeiska\s+kommissionen\b",
+    r"\beuropaparlamentet\b", r"\br\u00e5det\b", r"\beuropeiska\s+r\u00e5det\b",
+    r"\bministerr\u00e5det\b",
+    r"\benisa\b", r"\beu[\-\u2013]cyclone\b", r"\bcsirt\b",
+    r"\bcsirt[\-\u2013]enheter(?:na)?\b", r"\bcsirt[\-\u2013]n\u00e4tverket\b",
+    r"\bsamarbetsgruppen\b",
+    r"\beuropeiska\s+datatillsynsmannen\b",
+    r"\beuropeiska\s+unionens\s+byr\u00e5\b",
+    r"\bthe\s+commission\b", r"\beuropean\s+commission\b",
+    r"\beuropean\s+parliament\b", r"\bthe\s+council\b", r"\bcouncil\b",
+]
 
-MEMBER_STATE_SUBJECTS = {
-    "medlemsstaterna", "medlemsstaten", "varje medlemsstat",
-    "medlemsstaternas", "den berörda medlemsstaten",
-    "de behöriga myndigheterna", "den behöriga myndigheten",
-    "behöriga myndigheter", "behörig myndighet",
-    "den gemensamma kontaktpunkten", "gemensamma kontaktpunkter",
-    "nationella myndigheter", "tillsynsmyndigheten", "tillsynsmyndigheterna",
-    "member states", "the member state", "competent authorities",
-    "the competent authority",
-}
+MEMBER_STATE_PATTERNS = [
+    r"\bmedlemsstat(?:en|erna|er|ernas|s)?\b",
+    r"\bvarje\s+medlemsstat\b",
+    r"\bde(?:n)?\s+ber\u00f6rda\s+medlemsstat(?:en|erna)?\b",
+    r"\bde\s+beh\u00f6riga\s+myndigheterna?\b",
+    r"\bden\s+beh\u00f6riga\s+myndigheten\b",
+    r"\bbeh\u00f6rig(?:a)?\s+myndighet(?:en|er|erna)?\b",
+    r"\bden\s+gemensamma\s+kontaktpunkten\b",
+    r"\bgemensamma\s+kontaktpunkter\b",
+    r"\bnationella\s+myndigheter(?:na)?\b",
+    r"\btillsynsmyndighet(?:en|erna)?\b",
+    r"\bmember\s+states?\b",
+    r"\bthe\s+competent\s+authorit(?:y|ies)\b",
+    r"\bcompetent\s+authorit(?:y|ies)\b",
+]
 
-# Mönster för att identifiera krav
+EU_SUBJECTS_RE = re.compile("|".join(EU_SUBJECTS_PATTERNS), re.IGNORECASE)
+MEMBER_STATE_RE = re.compile("|".join(MEMBER_STATE_PATTERNS), re.IGNORECASE)
+
+# Monster for att identifiera krav
 OBLIGATION_TRIGGERS_SV = re.compile(
-    r"\b(?:ska|skall|måste|bör|är\s+skyldiga?\s+att|åligger|"
-    r"ansvarar?\s+för\s+att|krävs\s+att|fordras\s+att)\b",
+    r"\b(?:ska|skall|m\u00e5ste|b\u00f6r|"
+    r"\u00e4r\s+skyldiga?\s+att|\u00e5ligger|"
+    r"ansvarar?\s+f\u00f6r\s+att|kr\u00e4vs\s+att|fordras\s+att)\b",
     re.IGNORECASE,
 )
 
@@ -303,21 +508,46 @@ OBLIGATION_TRIGGERS_EN = re.compile(
     re.IGNORECASE,
 )
 
-# Kända subjektsmönster (entiteter/verksamheter som vi vill behålla)
-ENTITY_SUBJECTS = re.compile(
-    r"\b(?:entiteter(?:na)?|väsentliga\s+entiteter(?:na)?|"
-    r"viktiga\s+entiteter(?:na)?|"
-    r"(?:väsentliga\s+och\s+viktiga|viktiga\s+och\s+väsentliga)\s+entiteter(?:na)?|"
-    r"operatörer(?:na)?|tjänsteleverantörer(?:na)?|"
-    r"leverantörer(?:na)?|tillhandahållare(?:n)?|"
-    r"den\s+berörda\s+entiteten|berörda\s+entiteter(?:na)?|"
-    r"verksamhetsutövare(?:n|na)?|"
-    r"företag(?:et|en)?|organisationer(?:na)?|"
-    r"registreringsenheter(?:na)?|"
+# Kanda subjektsmonster for entiteter/verksamheter
+ENTITY_SUBJECTS_RE = re.compile(
+    r"\b(?:"
+    r"(?:v\u00e4sentliga\s+och\s+viktiga|viktiga\s+och\s+v\u00e4sentliga)\s+entiteter(?:na)?|"
+    r"v\u00e4sentliga\s+entiteter(?:na)?|viktiga\s+entiteter(?:na)?|"
+    r"(?:den\s+)?(?:ber\u00f6rda\s+)?entitet(?:en|er|erna)?|"
+    r"operat\u00f6r(?:en|er|erna)?|"
+    r"tj\u00e4nsteleverant\u00f6r(?:en|er|erna)?|"
+    r"leverant\u00f6r(?:en|er|erna)?|"
+    r"tillhandah\u00e5llar(?:en|e|na)?|"
+    r"verksamhetsut\u00f6var(?:en|e|na)?|"
+    r"f\u00f6retag(?:et|en|ets|ens)?|"
+    r"organisation(?:en|er|erna)?|"
+    r"registreringsenhet(?:en|er|erna)?|"
+    r"ledningsorgan(?:et|en|ets|ens)?|"
     r"entities|essential\s+entities|important\s+entities|"
-    r"operators|providers|undertakings)\b",
+    r"operators|providers|undertakings"
+    r")\b",
     re.IGNORECASE,
 )
+
+# Passiv-form-indikatorer
+PASSIVE_PATTERN = re.compile(
+    r"\b(?:antas|rapporteras|l\u00e4mnas|vidtas|baseras|utf\u00f6rs|genomf\u00f6rs|"
+    r"inr\u00e4ttas|fastst\u00e4lls|godk\u00e4nns|meddelas|underr\u00e4ttas|"
+    r"s\u00e4kerst\u00e4lls|uppfylls|tillhandah\u00e5lls|inges|"
+    r"is\s+adopted|is\s+reported|is\s+submitted|shall\s+be)\b",
+    re.IGNORECASE,
+)
+
+# Artikelrubriker som gor hela artikeln icke-relevant
+NON_RELEVANT_TITLES = {
+    "inforlivande", "inf\u00f6rlivande",
+    "\u00e4ndring", "andring",
+    "upph\u00e4vande", "upphavande",
+    "ikrafttr\u00e4dande", "ikrafttradande",
+    "\u00f6verg\u00e5ngsbest\u00e4mmelser",
+    "transposition", "amendment", "repeal", "entry into force",
+    "transitional provisions",
+}
 
 
 def _clean_text(t: str) -> str:
@@ -325,76 +555,128 @@ def _clean_text(t: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
-def _extract_subject(sentence: str, prev_subject: str) -> tuple[str, str]:
+def _is_non_relevant_article(article: Article) -> bool:
+    """Kolla om en artikel har en underrubrik som gor den icke-relevant."""
+    if article.title:
+        title_lower = article.title.strip().lower()
+        for nr_title in NON_RELEVANT_TITLES:
+            if nr_title in title_lower:
+                return True
+    return False
+
+
+def _categorize_subject(subject_text: str) -> str:
+    """Kategorisera ett subjekt som 'eu', 'member_state', 'entity' eller 'other'."""
+    if EU_SUBJECTS_RE.search(subject_text):
+        return "eu"
+    if MEMBER_STATE_RE.search(subject_text):
+        return "member_state"
+    if ENTITY_SUBJECTS_RE.search(subject_text):
+        return "entity"
+    return "other"
+
+
+def _extract_subject_from_clause(sentence: str) -> tuple[str, str]:
+    """
+    Extrahera subjekt fran att-bisatser.
+    "Medlemsstaterna ska sakerst\u00e4lla att entiteter vidtar atgarder"
+    -> ("entiteter", "entity")
+    """
+    # Monster: "att SUBJEKT ska/vidtar/..."
+    att_clause = re.search(
+        r'\batt\s+([\w\u00e4\u00f6\u00e5\s]+?)\s+'
+        r'(?:ska|skall|vidtar|genomf\u00f6r|s\u00e4kerst\u00e4ller|antar|'
+        r'uppfyller|tillhandah\u00e5ller|rapporterar|meddelar|inr\u00e4ttar|'
+        r'utf\u00f6r|har|f\u00e5r|anm\u00e4ler|underrättar)\b',
+        sentence,
+        re.IGNORECASE,
+    )
+    if att_clause:
+        candidate = att_clause.group(1).strip()
+        cat = _categorize_subject(candidate)
+        if cat == "entity":
+            return candidate, cat
+    return "", ""
+
+
+def _extract_subject(sentence: str, prev_subject: str, prev_cat: str) -> tuple[str, str, str]:
     """
     Extrahera subjektet ur en mening.
-    Returnerar (subjekt, kategori).
-    Kategori: "entity", "eu", "member_state", "other"
+    Returnerar (original_subject, category, raw_for_splitting).
+
+    Hanterar:
+    - Direkta subjekt ("Entiteter ska...")
+    - Att-bisatser ("Medlemsstaterna ska sakerst\u00e4lla att entiteter...")
+    - Passiv form (anvander foregaende subjekt)
     """
-    s_lower = sentence.lower()
 
-    # Sök efter specifika entitets-subjekt först
-    ent_match = ENTITY_SUBJECTS.search(sentence)
+    # 1. Forst: kolla att-bisatser (objektbisatser)
+    clause_subj, clause_cat = _extract_subject_from_clause(sentence)
+    if clause_subj and clause_cat == "entity":
+        return clause_subj, clause_cat, clause_subj
+
+    # 2. Sok efter entitets-subjekt direkt i meningen
+    ent_match = ENTITY_SUBJECTS_RE.search(sentence)
     if ent_match:
-        return ent_match.group(0).strip(), "entity"
+        raw = ent_match.group(0).strip()
+        return raw, "entity", raw
 
-    # Sök efter EU-institutioner
-    for eu_sub in EU_SUBJECTS:
-        if eu_sub in s_lower:
-            return eu_sub.capitalize(), "eu"
+    # 3. Kolla om passiv form -> anvand foregaende subjekt
+    if PASSIVE_PATTERN.search(sentence) and prev_subject:
+        return prev_subject, prev_cat, prev_subject
 
-    # Sök efter medlemsstater/myndigheter
-    for ms_sub in MEMBER_STATE_SUBJECTS:
-        if ms_sub in s_lower:
-            return ms_sub.capitalize(), "member_state"
+    # 4. Sok efter EU-institutioner
+    eu_match = EU_SUBJECTS_RE.search(sentence)
+    if eu_match:
+        return eu_match.group(0).strip(), "eu", eu_match.group(0).strip()
 
-    # Försök hitta subjekt innan "ska"/"shall" etc.
+    # 5. Sok efter medlemsstater/myndigheter
+    ms_match = MEMBER_STATE_RE.search(sentence)
+    if ms_match:
+        # Men kolla AVEN bisatser har
+        clause_subj2, clause_cat2 = _extract_subject_from_clause(sentence)
+        if clause_subj2:
+            return clause_subj2, clause_cat2, clause_subj2
+        return ms_match.group(0).strip(), "member_state", ms_match.group(0).strip()
+
+    # 6. Forsok hitta subjekt fore "ska"/"shall" etc.
     trigger = OBLIGATION_TRIGGERS_SV.search(sentence) or OBLIGATION_TRIGGERS_EN.search(sentence)
     if trigger:
-        before = sentence[:trigger.start()].strip()
-        # Ta det sista substantivfrasen innan triggern
-        # T.ex. "Väsentliga och viktiga entiteter ska..."
-        before_clean = before.rstrip(" ,;:")
-        if before_clean:
-            # Kolla om det matchar en känd kategori
-            b_lower = before_clean.lower()
-            for eu_sub in EU_SUBJECTS:
-                if eu_sub in b_lower:
-                    return before_clean, "eu"
-            for ms_sub in MEMBER_STATE_SUBJECTS:
-                if ms_sub in b_lower:
-                    return before_clean, "member_state"
-            if ENTITY_SUBJECTS.search(before_clean):
-                return before_clean, "entity"
-            # Okänt subjekt — troligen en entitet om det inte är EU
-            if len(before_clean) < 100:
-                return before_clean, "other"
+        before = sentence[:trigger.start()].strip().rstrip(" ,;:")
+        if before and len(before) < 100:
+            cat = _categorize_subject(before)
+            return before, cat, before
 
-    # Implicit subjekt — använd föregående
-    if prev_subject:
-        return prev_subject, "entity_implicit"
+    # 7. Implicit subjekt fran foregaende kontext
+    if prev_subject and prev_cat == "entity":
+        return prev_subject, "entity", prev_subject
 
-    return "(okänt)", "other"
+    return "(ok\u00e4nt)", "other", ""
 
 
 def _is_list_intro(text: str) -> bool:
-    """Kolla om texten slutar med kolon, vilket indikerar en följande lista."""
+    """Kolla om texten slutar med kolon -> foljande lista."""
     return text.rstrip().endswith(":")
 
 
 def extract_obligations_from_articles(articles: list[Article]) -> list[Obligation]:
-    """Extrahera alla krav från en lista artiklar, med subjektsidentifiering."""
+    """Extrahera alla krav fran en lista artiklar, med subjektsidentifiering."""
     obligations = []
     prev_subject = ""
-    prev_subject_cat = "other"
+    prev_cat = "other"
 
     for art in articles:
+        # Skippa icke-relevanta artiklar (Inforlivande, Andring, etc.)
+        if _is_non_relevant_article(art):
+            continue
+
         for para in art.paragraphs:
             full_text = para.text
             sentences = re.split(r"(?<=[.;])\s+", full_text)
 
             list_intro_subject = ""
             list_intro_cat = ""
+            list_intro_raw = ""
 
             for sent in sentences:
                 sent = _clean_text(sent)
@@ -406,58 +688,89 @@ def extract_obligations_from_articles(articles: list[Article]) -> list[Obligatio
                     or OBLIGATION_TRIGGERS_EN.search(sent)
                 )
 
-                if is_obligation:
-                    subject, cat = _extract_subject(sent, prev_subject)
-                    prev_subject = subject
-                    prev_subject_cat = cat
+                # Kolla om det ar en punkt i en lista (a), b), etc.)
+                is_list_item = bool(re.match(r"^[a-z]\)", sent))
 
-                    # Om det är en list-intro ("X ska ha följande uppgifter:")
+                if is_obligation:
+                    raw_subj, cat, raw_for_split = _extract_subject(
+                        sent, prev_subject, prev_cat
+                    )
+
+                    # Uppdatera kontext for passiv/implicit
+                    if cat == "entity":
+                        prev_subject = raw_subj
+                        prev_cat = cat
+
+                    # Om det ar en list-intro ("X ska ha foljande uppgifter:")
                     if _is_list_intro(sent):
-                        list_intro_subject = subject
+                        list_intro_subject = raw_subj
                         list_intro_cat = cat
+                        list_intro_raw = raw_for_split
+
+                    # Dela sammansatta subjekt
+                    subjects = split_compound_subjects(raw_subj)
 
                     obligations.append(Obligation(
                         article=art.number,
                         paragraph=para.number,
                         text=sent,
-                        subject=subject,
+                        subjects=subjects,
+                        original_subject=raw_subj,
                         subject_category=cat,
                     ))
 
-                elif list_intro_subject:
-                    # Punkter som följer ett intro med krav
-                    # t.ex. "a) stödja och underlätta..."
-                    if re.match(r"^[a-z]\)", sent):
-                        obligations.append(Obligation(
-                            article=art.number,
-                            paragraph=para.number,
-                            text=sent,
-                            subject=list_intro_subject,
-                            subject_category=list_intro_cat,
-                        ))
+                elif is_list_item and list_intro_subject:
+                    # Punktlistor: varje punkt ar ett separat krav
+                    subjects = split_compound_subjects(list_intro_subject)
+                    obligations.append(Obligation(
+                        article=art.number,
+                        paragraph=para.number,
+                        text=sent,
+                        subjects=subjects,
+                        original_subject=list_intro_subject,
+                        subject_category=list_intro_cat,
+                    ))
 
-            # Nollställ list-intro efter stycke
+                elif is_list_item and prev_subject and prev_cat == "entity":
+                    # Lista utan explicit intro men med foregaende subjekt
+                    subjects = split_compound_subjects(prev_subject)
+                    obligations.append(Obligation(
+                        article=art.number,
+                        paragraph=para.number,
+                        text=sent,
+                        subjects=subjects,
+                        original_subject=prev_subject,
+                        subject_category=prev_cat,
+                    ))
+
+            # Nollstall list-intro efter stycke
             list_intro_subject = ""
             list_intro_cat = ""
+            list_intro_raw = ""
 
     return obligations
 
 
+def is_obligation_relevant(obl: Obligation) -> bool:
+    """Ar kravet relevant (dvs. riktat mot foretag/verksamheter)?"""
+    return obl.subject_category not in ("eu", "member_state")
+
+
 def is_obligation_text(text: str) -> bool:
-    """Kolla om en text innehåller kravindikatorer."""
+    """Kolla om en text innehaller kravindikatorer."""
     return bool(
         OBLIGATION_TRIGGERS_SV.search(text)
         or OBLIGATION_TRIGGERS_EN.search(text)
     )
 
 
-# ── GUI ─────────────────────────────────────────────────────────────────────
+# -- GUI ----------------------------------------------------------------------
 
 
 class EULagTexterGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("EU-lagtexter — Sök & Analysera")
+        self.root.title("EU-lagtexter \u2014 S\u00f6k & Analysera")
         self.root.geometry("1400x900")
         self.root.minsize(1000, 700)
 
@@ -468,7 +781,7 @@ class EULagTexterGUI:
         self._tooltip = None
 
         self._build_ui()
-        self._status("Redo. Ange sökkriterier och klicka Sök.")
+        self._status("Redo. Ange s\u00f6kkriterier och klicka S\u00f6k.")
 
     def _build_ui(self):
         style = ttk.Style()
@@ -496,7 +809,7 @@ class EULagTexterGUI:
         status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=5, pady=2)
 
     def _build_search_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Sök dokument", padding=8)
+        frame = ttk.LabelFrame(parent, text="S\u00f6k dokument", padding=8)
         frame.pack(fill=tk.X, padx=5, pady=(5, 2))
 
         row1 = ttk.Frame(frame)
@@ -506,12 +819,12 @@ class EULagTexterGUI:
         self.type_var = tk.StringVar(value="Alla")
         ttk.Combobox(
             row1, textvariable=self.type_var,
-            values=["Alla", "REG — Förordning", "DIR — Direktiv",
-                    "DEC — Beslut", "RECO — Rekommendation"],
+            values=["Alla", "REG \u2014 F\u00f6rordning", "DIR \u2014 Direktiv",
+                    "DEC \u2014 Beslut", "RECO \u2014 Rekommendation"],
             state="readonly", width=22,
         ).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row1, text="År:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(row1, text="\u00c5r:").pack(side=tk.LEFT, padx=(0, 4))
         self.year_var = tk.StringVar()
         ttk.Entry(row1, textvariable=self.year_var, width=8).pack(
             side=tk.LEFT, padx=(0, 15)
@@ -530,12 +843,12 @@ class EULagTexterGUI:
         kw_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
         kw_entry.bind("<Return>", lambda e: self._do_search())
 
-        self.search_btn = ttk.Button(row2, text="Sök", command=self._do_search)
+        self.search_btn = ttk.Button(row2, text="S\u00f6k", command=self._do_search)
         self.search_btn.pack(side=tk.LEFT, padx=4)
 
     def _build_results_panel(self, parent):
         frame = ttk.LabelFrame(
-            parent, text="Sökresultat — Tillgängliga dokument", padding=4
+            parent, text="S\u00f6kresultat \u2014 Tillg\u00e4ngliga dokument", padding=4
         )
         frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
 
@@ -574,11 +887,11 @@ class EULagTexterGUI:
         btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         self.add_btn = ttk.Button(
-            btn_frame, text="Lägg till valda >>", command=self._add_selected
+            btn_frame, text="L\u00e4gg till valda >>", command=self._add_selected
         )
         self.add_btn.pack(side=tk.LEFT, padx=4)
         self.add_all_btn = ttk.Button(
-            btn_frame, text="Lägg till alla >>>", command=self._add_all
+            btn_frame, text="L\u00e4gg till alla >>>", command=self._add_all
         )
         self.add_all_btn.pack(side=tk.LEFT, padx=4)
 
@@ -641,7 +954,7 @@ class EULagTexterGUI:
 
     def _build_obligations_panel(self, parent):
         frame = ttk.LabelFrame(
-            parent, text="Krav på verksamheter (ej EU/myndigheter)", padding=4
+            parent, text="Krav p\u00e5 verksamheter (ej EU/myndigheter)", padding=4
         )
         frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
 
@@ -691,7 +1004,7 @@ class EULagTexterGUI:
             side=tk.RIGHT, padx=4
         )
 
-    # ── Tooltip ─────────────────────────────────────────────────────────
+    # -- Tooltip ---------------------------------------------------------------
 
     def _show_tooltip(self, widget, text, x, y):
         self._hide_tooltip()
@@ -724,10 +1037,10 @@ class EULagTexterGUI:
                 return
         self._hide_tooltip()
 
-    # ── Sök ─────────────────────────────────────────────────────────────
+    # -- Sok -------------------------------------------------------------------
 
     def _do_search(self):
-        doc_type = self.type_var.get().split("—")[0].strip()
+        doc_type = self.type_var.get().split("\u2014")[0].strip()
         if doc_type == "Alla":
             doc_type = ""
         year = self.year_var.get().strip()
@@ -739,12 +1052,12 @@ class EULagTexterGUI:
 
         if not doc_type and not year and not keyword:
             messagebox.showwarning(
-                "Sök", "Ange minst ett sökkriterium (typ, år, eller nyckelord)."
+                "S\u00f6k", "Ange minst ett s\u00f6kkriterium (typ, \u00e5r, eller nyckelord)."
             )
             return
 
         self.search_btn.configure(state="disabled")
-        self._status("Söker...")
+        self._status("S\u00f6ker...")
 
         def _search():
             try:
@@ -754,7 +1067,7 @@ class EULagTexterGUI:
                 self.root.after(0, lambda: self._show_results(docs))
             except Exception as e:
                 self.root.after(
-                    0, lambda: messagebox.showerror("Sökfel", str(e))
+                    0, lambda: messagebox.showerror("S\u00f6kfel", str(e))
                 )
             finally:
                 self.root.after(
@@ -795,12 +1108,12 @@ class EULagTexterGUI:
         )
         self._refresh_results_tree()
 
-    # ── Lägg till / ta bort ─────────────────────────────────────────────
+    # -- Lagg till / ta bort ---------------------------------------------------
 
     def _add_selected(self):
         sel = self.results_tree.selection()
         if not sel:
-            messagebox.showinfo("Lägg till", "Välj dokument i sökresultaten.")
+            messagebox.showinfo("L\u00e4gg till", "V\u00e4lj dokument i s\u00f6kresultaten.")
             return
         for iid in sel:
             doc = next((d for d in self.search_results if d.celex == iid), None)
@@ -837,10 +1150,10 @@ class EULagTexterGUI:
             )
         self.selected_count_var.set(f"{len(self.selected_docs)} dokument")
 
-    # ── Artikelvisning ──────────────────────────────────────────────────
+    # -- Artikelvisning --------------------------------------------------------
 
     def _ensure_parsed(self, doc: Document):
-        """Säkerställ att dokumentet har hämtats och parsats."""
+        """Sakerst\u00e4ll att dokumentet har hamtats och parsats."""
         if not doc.raw_html:
             doc.raw_html = fetch_html(doc.celex, lang="SV")
             if len(doc.raw_html) < 500:
@@ -853,14 +1166,14 @@ class EULagTexterGUI:
     def _open_article_viewer(self):
         sel = self.selected_tree.selection()
         if not sel:
-            messagebox.showinfo("Visa", "Välj ett dokument i listan.")
+            messagebox.showinfo("Visa", "V\u00e4lj ett dokument i listan.")
             return
         celex = sel[0]
         doc = next((d for d in self.selected_docs if d.celex == celex), None)
         if not doc:
             return
 
-        self._status(f"Hämtar och analyserar {celex}...")
+        self._status(f"H\u00e4mtar och analyserar {celex}...")
 
         def _work():
             try:
@@ -877,8 +1190,10 @@ class EULagTexterGUI:
 
     def _show_article_window(self, doc: Document):
         win = tk.Toplevel(self.root)
-        win.title(f"{doc.celex} — {doc.title}")
+        win.title(f"{doc.celex} \u2014 {doc.title}")
         win.geometry("1200x850")
+
+        relevant_count = len([o for o in doc.obligations if is_obligation_relevant(o)])
 
         # Rubrik
         ttk.Label(
@@ -888,20 +1203,20 @@ class EULagTexterGUI:
             win,
             text=f"CELEX: {doc.celex}  |  Datum: {doc.date}  |  Typ: {doc.doc_type}"
             f"  |  {len(doc.articles)} artiklar"
-            f"  |  {len([o for o in doc.obligations if o.subject_category not in ('eu', 'member_state')])} krav på verksamheter",
+            f"  |  {relevant_count} krav p\u00e5 verksamheter",
         ).pack(padx=10, pady=(0, 5), anchor=tk.W)
 
         ttk.Separator(win, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=10, pady=2)
 
-        # Huvudpanel: artikeltext (vänster) + kravlista per subjekt (höger)
+        # Huvudpanel: artikeltext (vanster) + kravlista per subjekt (hoger)
         pane = ttk.PanedWindow(win, orient=tk.HORIZONTAL)
         pane.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Vänster: Artikeltext med färgkodning
+        # Vanster: Artikeltext med fargkodning
         left = ttk.Frame(pane)
         pane.add(left, weight=2)
 
-        ttk.Label(left, text="Artiklar (krav = svart, övrig text = grå)",
+        ttk.Label(left, text="Artiklar (svart = krav p\u00e5 verksamheter, gr\u00e5 = \u00f6vrig text)",
                   font=("Segoe UI", 9, "italic")).pack(anchor=tk.W, padx=5)
 
         text_widget = tk.Text(
@@ -920,58 +1235,65 @@ class EULagTexterGUI:
         text_widget.tag_configure("article_title", font=("Segoe UI", 10, "italic"),
                                   spacing3=6)
         text_widget.tag_configure("para_num", font=("Segoe UI", 10, "bold"))
-        text_widget.tag_configure("obligation", foreground="#000000",
+        text_widget.tag_configure("obligation_relevant", foreground="#000000",
                                   font=("Segoe UI", 10))
-        text_widget.tag_configure("obligation_entity",
-                                  foreground="#000000",
-                                  background="#e8f5e9",
-                                  font=("Segoe UI", 10, "bold"))
-        text_widget.tag_configure("non_obligation", foreground="#999999",
+        text_widget.tag_configure("non_relevant", foreground="#999999",
                                   font=("Segoe UI", 10))
         text_widget.tag_configure("separator", foreground="#cccccc")
 
-        # Bygg artikelinnehåll med kravmarkering
-        obligation_texts = {o.text for o in doc.obligations
-                           if o.subject_category not in ("eu", "member_state")}
+        # Bygg ett set av kravtexter som ar relevanta (for verksamheter)
+        relevant_obligation_texts = {
+            o.text for o in doc.obligations if is_obligation_relevant(o)
+        }
+        # Aven alla kravtexter (inklusive EU/medlemsstat) for att kunna
+        # skilja "krav men pa EU" fran "ingen krav alls"
+        all_obligation_texts = {o.text for o in doc.obligations}
+
+        non_relevant_articles = {
+            art.number for art in doc.articles if _is_non_relevant_article(art)
+        }
 
         for art in doc.articles:
+            is_non_rel_art = art.number in non_relevant_articles
+
             # Artikelrubrik
-            text_widget.insert(tk.END, f"\nArtikel {art.number}", "article_header")
+            header_tag = "non_relevant" if is_non_rel_art else "article_header"
+            text_widget.insert(tk.END, f"\nArtikel {art.number}", header_tag)
             if art.title:
-                text_widget.insert(tk.END, f"\n{art.title}", "article_title")
+                title_tag = "non_relevant" if is_non_rel_art else "article_title"
+                text_widget.insert(tk.END, f"\n{art.title}", title_tag)
             text_widget.insert(tk.END, "\n")
 
             for para in art.paragraphs:
                 if para.number:
-                    text_widget.insert(tk.END, f"\n{para.number}.   ", "para_num")
+                    num_tag = "non_relevant" if is_non_rel_art else "para_num"
+                    text_widget.insert(tk.END, f"\n{para.number}.   ", num_tag)
 
-                # Dela texten i meningar för att kunna färgkoda
+                # Dela texten i meningar for att kunna fargkoda
                 sentences = re.split(r"(?<=[.;])\s+", para.text)
                 for sent in sentences:
                     sent_clean = _clean_text(sent)
                     if not sent_clean:
                         continue
 
-                    # Kolla om denna mening är ett krav
-                    is_obl = is_obligation_text(sent_clean)
-                    # Kolla om det är ett krav som rör verksamheter
-                    is_entity_obl = sent_clean in obligation_texts
-
-                    if is_entity_obl:
+                    if is_non_rel_art:
+                        # Hela artikeln ar icke-relevant
+                        text_widget.insert(tk.END, sent_clean + " ", "non_relevant")
+                    elif sent_clean in relevant_obligation_texts:
+                        # Krav pa verksamheter -> svart (normal)
                         text_widget.insert(tk.END, sent_clean + " ",
-                                           "obligation_entity")
-                    elif is_obl:
-                        text_widget.insert(tk.END, sent_clean + " ", "obligation")
+                                           "obligation_relevant")
                     else:
-                        text_widget.insert(tk.END, sent_clean + " ", "non_obligation")
+                        # Ovrig text (inklusive krav pa EU/medlemsstater) -> gra
+                        text_widget.insert(tk.END, sent_clean + " ", "non_relevant")
 
                 text_widget.insert(tk.END, "\n")
 
-            text_widget.insert(tk.END, "\n" + "─" * 60 + "\n", "separator")
+            text_widget.insert(tk.END, "\n" + "\u2500" * 60 + "\n", "separator")
 
         text_widget.configure(state="disabled")
 
-        # Höger: Kravlista per subjekt
+        # Hoger: Kravlista per subjekt
         right = ttk.Frame(pane)
         pane.add(right, weight=1)
 
@@ -991,13 +1313,14 @@ class EULagTexterGUI:
         subj_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         subj_tree.pack(fill=tk.BOTH, expand=True)
 
-        # Gruppera krav per subjekt (uteslut EU/myndigheter)
+        # Gruppera krav per normaliserat subjekt (uteslut EU/myndigheter)
         by_subject: dict[str, list[Obligation]] = {}
         for obl in doc.obligations:
-            if obl.subject_category in ("eu", "member_state"):
+            if not is_obligation_relevant(obl):
                 continue
-            subj = obl.subject
-            by_subject.setdefault(subj, []).append(obl)
+            # Varje krav kan ha flera subjekt
+            for subj in obl.subjects:
+                by_subject.setdefault(subj, []).append(obl)
 
         for subj, obls in sorted(by_subject.items()):
             parent_id = subj_tree.insert(
@@ -1012,7 +1335,7 @@ class EULagTexterGUI:
                     values=(obl_text,),
                 )
 
-        # Dubbelklick öppnar fullständig kravtext
+        # Dubbelklick oppnar fullstandig kravtext
         def _on_subj_double_click(event):
             item = subj_tree.selection()
             if not item:
@@ -1031,7 +1354,7 @@ class EULagTexterGUI:
 
         subj_tree.bind("<Double-1>", _on_subj_double_click)
 
-        # Tooltip för subjekt-trädvy
+        # Tooltip for subjekt-tradvy
         def _on_subj_motion(event):
             item = subj_tree.identify_row(event.y)
             col = subj_tree.identify_column(event.x)
@@ -1046,14 +1369,14 @@ class EULagTexterGUI:
         subj_tree.bind("<Motion>", _on_subj_motion)
         subj_tree.bind("<Leave>", self._hide_tooltip)
 
-    # ── Kravextrahering ─────────────────────────────────────────────────
+    # -- Kravextrahering -------------------------------------------------------
 
     def _extract_all_obligations(self):
         if not self.selected_docs:
-            messagebox.showinfo("Krav", "Lägg till dokument först.")
+            messagebox.showinfo("Krav", "L\u00e4gg till dokument f\u00f6rst.")
             return
 
-        self._status("Hämtar och analyserar dokument...")
+        self._status("H\u00e4mtar och analyserar dokument...")
 
         def _work():
             total = 0
@@ -1063,19 +1386,18 @@ class EULagTexterGUI:
                 except Exception:
                     continue
                 entity_obls = [
-                    o for o in doc.obligations
-                    if o.subject_category not in ("eu", "member_state")
+                    o for o in doc.obligations if is_obligation_relevant(o)
                 ]
                 total += len(entity_obls)
                 self.root.after(
                     0, lambda d=doc, t=total: self._status(
                         f"Analyserat {d.celex}: {len(d.obligations)} krav totalt, "
-                        f"{t} på verksamheter"
+                        f"{t} p\u00e5 verksamheter"
                     ),
                 )
             self.root.after(0, self._refresh_obligations_tree)
             self.root.after(
-                0, lambda: self._status(f"Klar — {total} krav på verksamheter.")
+                0, lambda: self._status(f"Klar \u2014 {total} krav p\u00e5 verksamheter.")
             )
 
         threading.Thread(target=_work, daemon=True).start()
@@ -1085,13 +1407,15 @@ class EULagTexterGUI:
         count = 0
         for doc in self.selected_docs:
             for i, obl in enumerate(doc.obligations):
-                if obl.subject_category in ("eu", "member_state"):
+                if not is_obligation_relevant(obl):
                     continue
+                # Visa varje normaliserat subjekt
+                subj_display = ", ".join(obl.subjects)
                 iid = f"{doc.celex}__{i}"
                 self.oblig_tree.insert(
                     "", tk.END, iid=iid,
                     values=(doc.celex, f"{obl.article}.{obl.paragraph}",
-                            obl.subject, obl.text),
+                            subj_display, obl.text),
                 )
                 count += 1
         self.oblig_count_var.set(f"{count} krav")
@@ -1104,7 +1428,7 @@ class EULagTexterGUI:
         if not values:
             return
         win = tk.Toplevel(self.root)
-        win.title(f"Krav — {values[0]} Art. {values[1]}")
+        win.title(f"Krav \u2014 {values[0]} Art. {values[1]}")
         win.geometry("700x300")
         ttk.Label(win, text=f"Dokument: {values[0]}",
                   font=("Segoe UI", 10, "bold")).pack(padx=10, pady=(10, 2), anchor=tk.W)
@@ -1118,12 +1442,12 @@ class EULagTexterGUI:
         st.insert(tk.END, values[3])
         st.configure(state="disabled")
 
-    # ── Export ──────────────────────────────────────────────────────────
+    # -- Export ----------------------------------------------------------------
 
     def _export_obligations(self):
         has_any = any(
             o for d in self.selected_docs for o in d.obligations
-            if o.subject_category not in ("eu", "member_state")
+            if is_obligation_relevant(o)
         )
         if not has_any:
             messagebox.showinfo("Export", "Inga krav att exportera.")
@@ -1143,33 +1467,35 @@ class EULagTexterGUI:
                 f.write("Dokument\tArtikel\tSubjekt\tKategori\tKrav\n")
                 for doc in self.selected_docs:
                     for obl in doc.obligations:
-                        if obl.subject_category in ("eu", "member_state"):
+                        if not is_obligation_relevant(obl):
                             continue
                         text = obl.text.replace("\t", " ").replace("\n", " ")
+                        subj_display = ", ".join(obl.subjects)
                         f.write(
                             f"{doc.celex}\t{obl.article}.{obl.paragraph}\t"
-                            f"{obl.subject}\t{obl.subject_category}\t{text}\n"
+                            f"{subj_display}\t{obl.subject_category}\t{text}\n"
                         )
             else:
                 for doc in self.selected_docs:
                     entity_obls = [
-                        o for o in doc.obligations
-                        if o.subject_category not in ("eu", "member_state")
+                        o for o in doc.obligations if is_obligation_relevant(o)
                     ]
                     if not entity_obls:
                         continue
                     f.write(f"{'=' * 80}\n")
                     f.write(f"Dokument: {doc.celex}\n")
                     f.write(f"Titel:    {doc.title}\n")
-                    f.write(f"{'─' * 80}\n\n")
+                    f.write(f"{'\u2500' * 80}\n\n")
 
+                    # Gruppera per normaliserat subjekt
                     by_subj: dict[str, list] = {}
                     for obl in entity_obls:
-                        by_subj.setdefault(obl.subject, []).append(obl)
+                        for subj in obl.subjects:
+                            by_subj.setdefault(subj, []).append(obl)
 
                     for subj, obls in sorted(by_subj.items()):
                         f.write(f"  SUBJEKT: {subj}\n")
-                        f.write(f"  {'─' * 40}\n")
+                        f.write(f"  {'\u2500' * 40}\n")
                         for i, obl in enumerate(obls, 1):
                             f.write(f"  [{i}] Art. {obl.article}.{obl.paragraph}\n")
                             f.write(f"      {obl.text}\n\n")
@@ -1177,7 +1503,7 @@ class EULagTexterGUI:
         self._status(f"Exporterat till {path}")
         messagebox.showinfo("Export", f"Krav exporterade till:\n{path}")
 
-    # ── Status ──────────────────────────────────────────────────────────
+    # -- Status ----------------------------------------------------------------
 
     def _status(self, text: str):
         self.status_var.set(text)
