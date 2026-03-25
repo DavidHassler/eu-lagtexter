@@ -354,7 +354,49 @@ LIMIT {limit}
     return docs
 
 
+def _find_xhtml_manifestation(celex: str, lang: str = "SWE") -> str:
+    """Hitta XHTML-manifestation-URL via SPARQL i Cellar."""
+    lang_uri = f"http://publications.europa.eu/resource/authority/language/{lang}"
+    # Använd CONTAINS + exakt CELEX-matchning (= fungerar inte pga datatypsskillnad)
+    query = f"""
+PREFIX cdm: <http://publications.europa.eu/ontology/cdm#>
+SELECT ?manif ?mtype WHERE {{
+  ?work cdm:resource_legal_id_celex ?celex .
+  ?expr cdm:expression_belongs_to_work ?work .
+  ?expr cdm:expression_uses_language <{lang_uri}> .
+  ?manif cdm:manifestation_manifests_expression ?expr .
+  OPTIONAL {{ ?manif cdm:manifestation_type ?mtype }}
+  FILTER(CONTAINS(?celex, "{celex}") && !CONTAINS(?celex, "R("))
+}}
+LIMIT 10
+"""
+    rows = sparql_query(query)
+    # Föredra xhtml > fmx4
+    for preferred in ("xhtml", "fmx4"):
+        for row in rows:
+            if row.get("mtype", "") == preferred:
+                return row.get("manif", "")
+    # Om inget format hittades, returnera första bästa
+    if rows:
+        return rows[0].get("manif", "")
+    return ""
+
+
 def fetch_html(celex: str, lang: str = "SV") -> str:
+    """Hämta XHTML/HTML-innehåll via Cellar (undviker WAF-blockering)."""
+    lang_map = {"SV": "SWE", "EN": "ENG", "DE": "DEU", "FR": "FRA"}
+    cellar_lang = lang_map.get(lang, lang)
+
+    manif_url = _find_xhtml_manifestation(celex, cellar_lang)
+    if manif_url:
+        req = urllib.request.Request(
+            manif_url,
+            headers={"Accept": "application/xhtml+xml, text/html, text/xml",
+                     "User-Agent": "EU-Lagtexter/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+
+    # Sista utväg: direkt EUR-Lex (kan blockeras av WAF)
     url = EURLEX_HTML_URL.format(lang=lang, celex=celex)
     req = urllib.request.Request(url, headers={"User-Agent": "EU-Lagtexter/1.0"})
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -378,16 +420,20 @@ def strip_html(html_text: str) -> str:
 
 def parse_articles(raw_html: str) -> list[Article]:
     articles = []
+    # \xa0 = non-breaking space, \s = whitespace — EUR-Lex använder båda
     art_header_pattern = re.compile(
-        r'<p[^>]*class="oj-ti-art"[^>]*>(Artikel)\s*\W*(\d+)</p>', re.IGNORECASE)
+        r'<p[^>]*class="oj-ti-art"[^>]*>\s*(?:Artikel|Article)\s*[\s\xa0\W]*(\d+)\s*</p>',
+        re.IGNORECASE)
     headers = list(art_header_pattern.finditer(raw_html))
     if not headers:
+        # Fallback: enklare mönster utan class-attribut
         art_header_pattern = re.compile(
-            r'<p[^>]*class="oj-ti-art"[^>]*>(Article)\s*\W*(\d+)</p>', re.IGNORECASE)
+            r'<p[^>]*>\s*(?:Artikel|Article)\s*[\s\xa0\W]*(\d+)\s*</p>',
+            re.IGNORECASE)
         headers = list(art_header_pattern.finditer(raw_html))
 
     for i, match in enumerate(headers):
-        art_num = match.group(2)
+        art_num = match.group(1)
         start = match.end()
         end = headers[i + 1].start() if i + 1 < len(headers) else len(raw_html)
         section_html = raw_html[start:end]
@@ -412,7 +458,7 @@ def _parse_paragraphs(section_html: str) -> list[Paragraph]:
         text = strip_html(raw).strip()
         if not text:
             continue
-        num_match = re.match(r"^(\d+)\.\s{2,}", text)
+        num_match = re.match(r"^(\d+)\.\s[\s\xa0]+", text)
         if num_match:
             if current_text_parts:
                 paragraphs.append(Paragraph(number=current_para_num,
