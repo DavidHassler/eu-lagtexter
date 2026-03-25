@@ -392,7 +392,7 @@ def search_documents(doc_type="", year="", keyword="", eurovoc_tag="",
     if eurovoc_tag:
         safe_tag = eurovoc_tag.replace('"', '\\"')
         filters.append(
-            "?work cdm:work_is_about_concept ?concept .\n"
+            "?work cdm:work_is_about_concept_eurovoc ?concept .\n"
             "  ?concept skos:prefLabel ?conceptLabel .\n"
             f'  FILTER(LANG(?conceptLabel) = "sv" && '
             f'CONTAINS(LCASE(?conceptLabel), LCASE("{safe_tag}")))'
@@ -433,7 +433,7 @@ PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 SELECT DISTINCT ?label WHERE {{
   ?work cdm:resource_legal_id_celex ?celex .
   FILTER(CONTAINS(?celex, "{celex}") && !CONTAINS(?celex, "R("))
-  ?work cdm:work_is_about_concept ?concept .
+  ?work cdm:work_is_about_concept_eurovoc ?concept .
   ?concept skos:prefLabel ?label .
   FILTER(LANG(?label) = "sv")
 }}
